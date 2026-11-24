@@ -984,17 +984,6 @@
                     .replace(/\s+/g, " ")
                     .trim();
 
-            function formatAnswerDisplay(qOrAnswer, isExtended = false) {
-                if (typeof qOrAnswer === "object" && qOrAnswer !== null) {
-                    if (qOrAnswer.type === "extended") return qOrAnswer.model || qOrAnswer.answer || "";
-                    const parts = String(qOrAnswer.answer || "").split("|").map((s) => s.trim()).filter(Boolean);
-                    return parts.join(" · ");
-                }
-                if (isExtended) return String(qOrAnswer || "");
-                const parts = String(qOrAnswer || "").split("|").map((s) => s.trim()).filter(Boolean);
-                return parts.join(" · ");
-            }
-
             function textAnswerCorrect(answer, value) {
                 const v = norm(value);
                 if (!v) return false;
@@ -1421,6 +1410,7 @@
                     return 0;
                 }
 
+                // Preserve user edits/tags/favourites on matching repo items where possible
                 const existingById = new Map(Q.map((item) => [item.id, item]));
                 const manualQuestions = Q.filter((item) => !String(item._repoSource || "").startsWith(SYNCED_SET_PREFIX));
 
@@ -1687,7 +1677,7 @@
                 const practiceNote = !isFullMarks ? ` · Tagged "Needs practice"` : "";
                 $("#fb").innerHTML = `<div class="fb">
                     <p class="${isFullMarks ? "good" : "err"}" id="fb_status"><b>${isPositive ? `Descended +${pts * 10} m (${markLabel}${practiceNote})` : `Did not descend (+0 m · ${markLabel}${practiceNote})`}</b></p>
-                    <p><small>Answer:</small> <b>${esc(formatAnswerDisplay(q))}</b></p>
+                    <p><small>Answer:</small> <b>${esc(q.type === "extended" ? q.model || q.answer : String(q.answer || "").split("|")[0])}</b></p>
                     ${q.explain ? `<p class="meta">${esc(q.explain)}</p>` : ""}
                     <div class="row" id="fb_marks"><small>Marks awarded:</small> ${renderMarkSelector(maxMarks, earned, "m_pick")}</div>
                     <div class="row"><button class="pri" id="next">${isLast ? "Surface & see tier" : "Next prompt"}</button></div>
@@ -1774,7 +1764,7 @@
                 const sb = $("#sub");
                 if (sb) sb.remove();
 
-                const shown = formatAnswerDisplay(q);
+                const shown = q.type === "extended" ? q.model || q.answer : String(q.answer || "").split("|")[0];
                 if (
                     ok === null ||
                     (ok === false && (q.type === "short" || q.type === "fill") && v !== null && String(v).trim() !== "")
@@ -1865,7 +1855,7 @@
                                         return `<tr>
                                             <td class="${full ? "good" : "err"}">${full ? "✓" : "✕"}</td>
                                             <td>${esc(r.text)}</td>
-                                            <td>${esc(formatAnswerDisplay(r.answer))}</td>
+                                            <td>${esc(String(r.answer || "").split("|")[0])}</td>
                                             <td>${em}/${mm}</td>
                                             <td>+${r.pts * 10} m</td>
                                         </tr>`;

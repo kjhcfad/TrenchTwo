@@ -984,6 +984,17 @@
                     .replace(/\s+/g, " ")
                     .trim();
 
+            function formatAnswerDisplay(qOrAnswer, isExtended = false) {
+                if (typeof qOrAnswer === "object" && qOrAnswer !== null) {
+                    if (qOrAnswer.type === "extended") return qOrAnswer.model || qOrAnswer.answer || "";
+                    const parts = String(qOrAnswer.answer || "").split("|").map((s) => s.trim()).filter(Boolean);
+                    return parts.join(" · ");
+                }
+                if (isExtended) return String(qOrAnswer || "");
+                const parts = String(qOrAnswer || "").split("|").map((s) => s.trim()).filter(Boolean);
+                return parts.join(" · ");
+            }
+
             function textAnswerCorrect(answer, value) {
                 const v = norm(value);
                 if (!v) return false;
@@ -1410,7 +1421,6 @@
                     return 0;
                 }
 
-                // Preserve user edits/tags/favourites on matching repo items where possible
                 const existingById = new Map(Q.map((item) => [item.id, item]));
                 const manualQuestions = Q.filter((item) => !String(item._repoSource || "").startsWith(SYNCED_SET_PREFIX));
 
@@ -1434,10 +1444,101 @@
                 return mergedRepo.length;
             }
 
+
+            /* ---------- shareable dive links ---------- */
+            const SHARE_FILTER_KEYS = ["subject", "board", "topic", "subtopic", "difficulty", "set", "n"];
+            let sharedLinkHandled = false;
+
+            function applySharedUrlParams(baseFilters = {}) {
+                const next = { ...baseFilters };
+                const params = new URLSearchParams(window.location.search);
+                let hasFilterParam = false;
+
+                SHARE_FILTER_KEYS.forEach((key) => {
+                    if (params.has(key)) {
+                        hasFilterParam = true;
+                        const rawVal = params.get(key);
+                        if (key === "n") {
+                            const parsedN = parseInt(rawVal, 10);
+                            if (!Number.isNaN(parsedN) && parsedN > 0) {
+                                next.n = parsedN;
+                            }
+                        } else {
+                            next[key] = rawVal ?? "";
+                        }
+                    }
+                });
+
+                if (hasFilterParam) {
+                    LS.set("tr_f", next);
+                }
+
+                const autoDive = params.get("dive") === "1";
+                return { filters: next, autoDive };
+            }
+
+            function buildShareDeckUrl(currentFilters = {}) {
+                const url = new URL(window.location.href);
+                url.search = "";
+                url.searchParams.set("dive", "1");
+
+                SHARE_FILTER_KEYS.forEach((key) => {
+                    const val = currentFilters[key];
+                    if (val !== undefined && val !== null && String(val).trim() !== "") {
+                        url.searchParams.set(key, String(val).trim());
+                    }
+                });
+
+                return url.toString();
+            }
+
+            async function shareDeck(currentFilters = null) {
+                const fObj = currentFilters || LS.get("tr_f", {});
+                const shareUrl = buildShareDeckUrl(fObj);
+
+                try {
+                    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+                        await navigator.clipboard.writeText(shareUrl);
+                    } else {
+                        const tmp = document.createElement("textarea");
+                        tmp.value = shareUrl;
+                        tmp.setAttribute("readonly", "");
+                        tmp.style.position = "fixed";
+                        tmp.style.opacity = "0";
+                        document.body.appendChild(tmp);
+                        tmp.select();
+                        document.execCommand("copy");
+                        tmp.remove();
+                    }
+                    toast("Dive link copied!");
+                } catch (e) {
+                    toast("Copy link: " + shareUrl);
+                }
+            }
+
+            function maybeLaunchSharedDive(filters, autoDive) {
+                if (!autoDive || sharedLinkHandled) return false;
+                if (!Q.length) return false;
+
+                const count = +filters.n || 7;
+                const matchingPool = pool(filters);
+                if (!matchingPool.length) {
+                    sharedLinkHandled = true;
+                    toast("No questions found for that shared dive link");
+                    return false;
+                }
+
+                sharedLinkHandled = true;
+                startDive(filters, count);
+                return true;
+            }
+
             /* ---------- home ---------- */
             function home() {
-                const f = LS.get("tr_f", {}),
-                    sess = LS.get("tr_sess", null),
+                const storedF = LS.get("tr_f", {});
+                const { filters: f, autoDive } = applySharedUrlParams(storedF);
+                if (maybeLaunchSharedDive(f, autoDive)) return;
+                const sess = LS.get("tr_sess", null),
                     sets = [...new Set(Q.flatMap((q) => q.sets || []))];
                 if (!Q.length) {
                     app.innerHTML = `<h1>Dive in.</h1>
@@ -1463,6 +1564,7 @@
                     </div>
                     <div class="row">
                         <button class="pri" id="go">Start dive</button>
+                        <button class="ghost" id="share_deck_btn" type="button" onclick="shareDeck()">Share deck ↗</button>
                         ${sess && sess.i < sess.ids.length ? `<button class="ghost" id="res">Resume (${sess.i}/${sess.ids.length})</button>` : ""}
                         <small id="cnt"></small>
                     </div>
@@ -1677,7 +1779,7 @@
                 const practiceNote = !isFullMarks ? ` · Tagged "Needs practice"` : "";
                 $("#fb").innerHTML = `<div class="fb">
                     <p class="${isFullMarks ? "good" : "err"}" id="fb_status"><b>${isPositive ? `Descended +${pts * 10} m (${markLabel}${practiceNote})` : `Did not descend (+0 m · ${markLabel}${practiceNote})`}</b></p>
-                    <p><small>Answer:</small> <b>${esc(q.type === "extended" ? q.model || q.answer : String(q.answer || "").split("|")[0])}</b></p>
+                    <p><small>Answer:</small> <b>${esc(formatAnswerDisplay(q))}</b></p>
                     ${q.explain ? `<p class="meta">${esc(q.explain)}</p>` : ""}
                     <div class="row" id="fb_marks"><small>Marks awarded:</small> ${renderMarkSelector(maxMarks, earned, "m_pick")}</div>
                     <div class="row"><button class="pri" id="next">${isLast ? "Surface & see tier" : "Next prompt"}</button></div>
@@ -1764,7 +1866,7 @@
                 const sb = $("#sub");
                 if (sb) sb.remove();
 
-                const shown = q.type === "extended" ? q.model || q.answer : String(q.answer || "").split("|")[0];
+                const shown = formatAnswerDisplay(q);
                 if (
                     ok === null ||
                     (ok === false && (q.type === "short" || q.type === "fill") && v !== null && String(v).trim() !== "")
@@ -1855,7 +1957,7 @@
                                         return `<tr>
                                             <td class="${full ? "good" : "err"}">${full ? "✓" : "✕"}</td>
                                             <td>${esc(r.text)}</td>
-                                            <td>${esc(String(r.answer || "").split("|")[0])}</td>
+                                            <td>${esc(formatAnswerDisplay(r.answer))}</td>
                                             <td>${em}/${mm}</td>
                                             <td>+${r.pts * 10} m</td>
                                         </tr>`;
@@ -2516,10 +2618,36 @@
                 };
             }
 
-            // Boot router + sync CSV question sets from question-sets/ folder
+            // Boot router + sync CSV question sets from question-sets/ folder, then honour ?dive=1 if present
+            const initialUrlParams = new URLSearchParams(window.location.search);
+            const initialAutoDive = initialUrlParams.get("dive") === "1";
+            if (initialAutoDive) {
+                const { filters: initF } = applySharedUrlParams(LS.get("tr_f", {}));
+                if (Q.length && pool(initF).length) {
+                    sharedLinkHandled = true;
+                    currentDepth = 0;
+                    targetDepth = 0;
+                    G = {
+                        ids: pick(pool(initF), +initF.n || 7),
+                        i: 0,
+                        score: 0,
+                        res: [],
+                        f: { ...initF },
+                        intro: 0,
+                    };
+                    saveSess();
+                    location.hash = "play";
+                }
+            }
             route();
             syncQuestionSetsFromFolder(true).then((count) => {
-                if (count > 0) route();
+                if (count > 0) {
+                    const { filters: syncedF, autoDive: syncedAutoDive } = applySharedUrlParams(LS.get("tr_f", {}));
+                    if (syncedAutoDive && !sharedLinkHandled && maybeLaunchSharedDive(syncedF, true)) {
+                        return;
+                    }
+                    route();
+                }
             });
         </script>
     </body>

@@ -1,7 +1,8 @@
 {
   "files": [
-    "christian-beliefs.csv",
-    "gcse-core-mix.csv",
+    	"christian-beliefs.csv",
+    	"gcse-core-mix.csv",
 	"the-nature-and-variety-of-organisms.csv"
+	"human-nutrition.csv"
   ]
 }

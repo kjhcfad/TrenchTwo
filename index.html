@@ -1084,7 +1084,11 @@
             const PLAYER_KEY = "tr_player";
             const LB_MODE_KEY = "tr_lb_mode";
             const LB_ENDPOINT_KEY = "tr_lb_endpoint";
-            const DEFAULT_LB_ENDPOINT = "https://api.jsonbin.io/v3/b/6b080525ab3a7b61448246fb";
+            const ADMIN_PASS_KEY = "tr_admin_pass";
+            const ADMIN_AUTH_KEY = "tr_admin_authed";
+            const DEFAULT_ADMIN_PASS = "trench-admin";
+            const DEFAULT_LB_ENDPOINT = "https://api.jsonbin.io/v3/b/6b0805ab13d2c8610b13c2f4";
+            let lastSyncStatus = "";
 
             function isLeaderboardMode() {
                 return Boolean(LS.get(LB_MODE_KEY, false));
@@ -1107,13 +1111,59 @@
                 return clean;
             }
 
+            function normalizeNameKey(name) {
+                return String(name || "You").trim().replace(/\s+/g, " ").toLowerCase();
+            }
+
+            function compareLeaderboardRows(a, b) {
+                return (
+                    (Number(b?.depth) || 0) - (Number(a?.depth) || 0) ||
+                    (Number(b?.acc) || 0) - (Number(a?.acc) || 0) ||
+                    (Number(a?.ts) || 0) - (Number(b?.ts) || 0)
+                );
+            }
+
+            // Keep at most one (best) space per diver name within a set
+            function deduplicateSetRowsByName(rows) {
+                const bestByName = new Map();
+                (Array.isArray(rows) ? rows : []).forEach((row, idx) => {
+                    if (!row || typeof row !== "object") return;
+                    const cleanName = String(row.name || "You").trim().replace(/\s+/g, " ").slice(0, 28) || "You";
+                    const nameKey = normalizeNameKey(cleanName);
+                    const candidate = {
+                        ...row,
+                        id: row.id || `${nameKey}_${row.ts || 0}_${row.depth || 0}_${idx}`,
+                        name: cleanName,
+                        depth: Number(row.depth) || 0,
+                        score: Number(row.score) || 0,
+                        acc: Number(row.acc) || 0,
+                        count: Number(row.count) || 0,
+                        ts: Number(row.ts) || Date.now(),
+                    };
+                    const prev = bestByName.get(nameKey);
+                    if (!prev || compareLeaderboardRows(candidate, prev) < 0) {
+                        bestByName.set(nameKey, candidate);
+                    }
+                });
+                return [...bestByName.values()].sort(compareLeaderboardRows).slice(0, 15);
+            }
+
             function getLeaderboardStore() {
                 const raw = LS.get(LB_KEY, {});
-                return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+                if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+                const cleaned = {};
+                Object.keys(raw).forEach((setName) => {
+                    cleaned[setName] = deduplicateSetRowsByName(raw[setName]);
+                });
+                return cleaned;
             }
 
             function saveLeaderboardStore(store) {
-                return LS.set(LB_KEY, store);
+                const cleaned = {};
+                Object.keys(store || {}).forEach((setName) => {
+                    cleaned[setName] = deduplicateSetRowsByName(store[setName]);
+                });
+                return LS.set(LB_KEY, cleaned);
             }
 
             function mergeLeaderboardStores(baseStore, incomingStore) {
@@ -1127,41 +1177,47 @@
                         ...(Array.isArray(baseStore?.[setName]) ? baseStore[setName] : []),
                         ...(Array.isArray(incomingStore?.[setName]) ? incomingStore[setName] : []),
                     ];
-                    const byId = new Map();
-                    combined.forEach((row) => {
-                        if (!row || typeof row !== "object") return;
-                        const k = row.id || `${row.name || "You"}_${row.ts || 0}_${row.depth || 0}`;
-                        const prev = byId.get(k);
-                        if (!prev || (row.depth || 0) > (prev.depth || 0)) {
-                            byId.set(k, { ...row, id: k });
-                        }
-                    });
-                    merged[setName] = [...byId.values()]
-                        .sort((a, b) => (b.depth - a.depth) || (b.acc - a.acc) || (a.ts - b.ts))
-                        .slice(0, 15);
+                    merged[setName] = deduplicateSetRowsByName(combined);
                 });
                 return merged;
             }
 
             async function pullSharedLeaderboard(silent = true) {
                 const endpoint = getLeaderboardEndpoint();
-                if (!endpoint) return false;
+                if (!endpoint) {
+                    lastSyncStatus = "No shared endpoint configured";
+                    if (!silent) toast(lastSyncStatus);
+                    return false;
+                }
                 try {
-                    const res = await fetch(endpoint, { cache: "no-store" });
-                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    const res = await fetch(`${endpoint}/latest?meta=false`, {
+                        cache: "no-store",
+                        headers: { Accept: "application/json" },
+                    }).catch(() => fetch(endpoint, { cache: "no-store", headers: { Accept: "application/json" } }));
+                    if (!res.ok) {
+                        let detail = `HTTP ${res.status}`;
+                        try {
+                            const errJson = await res.json();
+                            if (errJson?.message) detail += `: ${errJson.message}`;
+                        } catch (e2) {}
+                        throw new Error(detail);
+                    }
                     const data = await res.json();
                     const remoteBoard =
                         data && typeof data === "object" && data.record && typeof data.record === "object"
-                            ? (data.record.leaderboard || data.record)
-                            : (data?.leaderboard || data);
+                            ? (data.record.leaderboard !== undefined ? data.record.leaderboard : data.record)
+                            : (data?.leaderboard !== undefined ? data.leaderboard : data);
                     if (remoteBoard && typeof remoteBoard === "object" && !Array.isArray(remoteBoard)) {
                         const merged = mergeLeaderboardStores(getLeaderboardStore(), remoteBoard);
                         saveLeaderboardStore(merged);
+                        lastSyncStatus = `Connected (${new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })})`;
                         if (!silent) toast("Synced shared leaderboard");
                         return true;
                     }
+                    throw new Error("Invalid JSON structure");
                 } catch (e) {
-                    if (!silent) toast("Using local leaderboard (remote sync unavailable)");
+                    lastSyncStatus = `Local only (${e.message || "network/CORS blocked"})`;
+                    if (!silent) toast(`Remote sync failed: ${e.message || "check bin permissions/URL"}`);
                 }
                 return false;
             }
@@ -1169,24 +1225,39 @@
             async function pushSharedLeaderboard(store) {
                 const endpoint = getLeaderboardEndpoint();
                 if (!endpoint) return false;
+                const cleanStore = {};
+                Object.keys(store || {}).forEach((k) => {
+                    cleanStore[k] = deduplicateSetRowsByName(store[k]);
+                });
                 try {
                     const res = await fetch(endpoint, {
                         method: "PUT",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ leaderboard: store, updatedAt: Date.now() }),
+                        body: JSON.stringify({ leaderboard: cleanStore, updatedAt: Date.now() }),
                     });
-                    return res.ok;
+                    if (!res.ok) {
+                        let detail = `HTTP ${res.status}`;
+                        try {
+                            const errJson = await res.json();
+                            if (errJson?.message) detail += `: ${errJson.message}`;
+                        } catch (e2) {}
+                        lastSyncStatus = `Push blocked (${detail})`;
+                        return false;
+                    }
+                    lastSyncStatus = `Synced (${new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })})`;
+                    return true;
                 } catch (e) {
+                    lastSyncStatus = `Push failed (${e.message || "network error"})`;
                     return false;
                 }
             }
 
             function getPlayerName() {
-                return String(LS.get(PLAYER_KEY, "") || "").trim();
+                return String(LS.get(PLAYER_KEY, "") || "").trim().replace(/\s+/g, " ");
             }
 
             function setPlayerName(name) {
-                const clean = String(name || "").trim().slice(0, 28);
+                const clean = String(name || "").trim().replace(/\s+/g, " ").slice(0, 28);
                 LS.set(PLAYER_KEY, clean);
                 return clean;
             }
@@ -1249,7 +1320,7 @@
             function recordLeaderboardEntry(session, depth, acc, tierName, playerName = "") {
                 const store = getLeaderboardStore();
                 const setNames = inferSessionSetNames(session);
-                const who = String(playerName || getPlayerName() || "You").trim() || "You";
+                const who = String(playerName || getPlayerName() || "Joel").trim().replace(/\s+/g, " ") || "Joel";
                 const entryId = uid();
 
                 setNames.forEach((setName) => {
@@ -1264,8 +1335,7 @@
                         tier: tierName,
                         ts: Date.now(),
                     });
-                    list.sort((a, b) => (b.depth - a.depth) || (b.acc - a.acc) || (a.ts - b.ts));
-                    store[setName] = list.slice(0, 15);
+                    store[setName] = deduplicateSetRowsByName(list);
                 });
 
                 saveLeaderboardStore(store);
@@ -1274,23 +1344,50 @@
             }
 
             function updateLeaderboardEntryName(entryId, newName) {
-                const clean = setPlayerName(newName) || "You";
+                const clean = setPlayerName(newName) || "Joel";
                 const store = getLeaderboardStore();
                 let changed = false;
                 Object.keys(store).forEach((setName) => {
-                    store[setName] = (store[setName] || []).map((row) => {
-                        if (row.id === entryId) {
-                            changed = true;
-                            return { ...row, name: clean };
-                        }
-                        return row;
-                    });
+                    store[setName] = deduplicateSetRowsByName(
+                        (store[setName] || []).map((row) => {
+                            if (row.id === entryId) {
+                                changed = true;
+                                return { ...row, name: clean };
+                            }
+                            return row;
+                        })
+                    );
                 });
                 if (changed) {
                     saveLeaderboardStore(store);
                     pushSharedLeaderboard(store);
                 }
                 return clean;
+            }
+
+            function removeLeaderboardEntry(setName, entryId) {
+                const store = getLeaderboardStore();
+                if (!Array.isArray(store[setName])) return false;
+                const nextRows = store[setName].filter((r) => r.id !== entryId);
+                if (nextRows.length === store[setName].length) return false;
+                store[setName] = deduplicateSetRowsByName(nextRows);
+                saveLeaderboardStore(store);
+                pushSharedLeaderboard(store);
+                return true;
+            }
+
+            function getAdminPasscode() {
+                const saved = String(LS.get(ADMIN_PASS_KEY, "") || "").trim();
+                return saved || DEFAULT_ADMIN_PASS;
+            }
+
+            function isAdminAuthed() {
+                return Boolean(sessionStorage.getItem(ADMIN_AUTH_KEY) === "1");
+            }
+
+            function setAdminAuthed(val) {
+                if (val) sessionStorage.setItem(ADMIN_AUTH_KEY, "1");
+                else sessionStorage.removeItem(ADMIN_AUTH_KEY);
             }
 
             function getAllLeaderboardSets() {
@@ -1302,7 +1399,7 @@
 
             function renderLeaderboardTable(setName, limit = 10, highlightId = "") {
                 const store = getLeaderboardStore();
-                const rows = (store[setName] || []).slice(0, limit);
+                const rows = deduplicateSetRowsByName(store[setName] || []).slice(0, limit);
                 if (!rows.length) {
                     return `<p class="meta">No dives recorded for <b>${esc(setName)}</b> yet. Turn on Leaderboard mode and complete a dive in this set to claim #1.</p>`;
                 }
@@ -1317,7 +1414,7 @@
                                 const dateStr = new Date(r.ts).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
                                 return `<tr style="${isHi ? "background:#0a7ea422;font-weight:600" : ""}">
                                     <td>${rankLabel}</td>
-                                    <td>${esc(r.name || "You")}</td>
+                                    <td>${esc(r.name || "Joel")}</td>
                                     <td><b>${Number(r.depth || 0).toLocaleString("en-GB")} m</b></td>
                                     <td>${r.acc ?? 0}% (${r.count || 0}q)</td>
                                     <td>${esc(r.tier || "—")}</td>
@@ -1330,7 +1427,7 @@
             }
 
             /* ---------- router ---------- */
-            const routes = { home, play, library, import: imp, leaderboard, stats };
+            const routes = { home, play, library, import: imp, leaderboard, admin, stats };
             function route() {
                 const r = location.hash.slice(1) || "home";
                 clearInterval(TM);
@@ -1343,6 +1440,7 @@
                         ["library", "Questions"],
                         ["import", "Import"],
                         ["leaderboard", "Leaderboard"],
+                        ["admin", "Admin"],
                         ["stats", "My stats"],
                     ]
                         .map(([h, n]) => `<a href="#${h}" class="${r === h ? "on" : ""}">${n}</a>`)
@@ -2879,7 +2977,7 @@
                             </select>
                         </label>
                         <label class="f">Diver name
-                            <input id="lb_default_name" type="text" maxlength="28" value="${esc(getPlayerName())}" placeholder="e.g. Byron">
+                            <input id="lb_default_name" type="text" maxlength="28" value="${esc(getPlayerName())}" placeholder="e.g. Joel">
                         </label>
                     </div>
                     <div class="row">
@@ -2993,6 +3091,149 @@
                         e.preventDefault();
                         selectedLbSet = link.dataset.set;
                         leaderboard();
+                    };
+                });
+            }
+
+            /* ---------- leaderboard admin ---------- */
+            function admin() {
+                if (!isAdminAuthed()) {
+                    app.innerHTML = `<h2>Leaderboard Admin</h2>
+                        <p class="sub">Enter the admin passcode to remove entries or reset a set's scores.</p>
+                        <div class="grid" style="max-width:340px">
+                            <label class="f">Admin passcode
+                                <input id="adm_pass_in" type="password" autocomplete="off" placeholder="Enter passcode">
+                            </label>
+                        </div>
+                        <div class="row">
+                            <button class="pri" id="adm_login_btn" type="button">Unlock Admin</button>
+                            <a href="#leaderboard"><button class="ghost" type="button">Back to Leaderboard</button></a>
+                        </div>
+                        <p class="meta">Default passcode: <code>${esc(DEFAULT_ADMIN_PASS)}</code> (can be changed once unlocked).</p>`;
+
+                    const tryUnlock = () => {
+                        const entered = String($("#adm_pass_in").value || "").trim();
+                        if (entered === getAdminPasscode()) {
+                            setAdminAuthed(true);
+                            toast("Admin unlocked");
+                            admin();
+                        } else {
+                            toast("Incorrect admin passcode");
+                        }
+                    };
+                    $("#adm_login_btn").onclick = tryUnlock;
+                    $("#adm_pass_in").addEventListener("keydown", (e) => {
+                        if (e.key === "Enter") tryUnlock();
+                    });
+                    $("#adm_pass_in").focus();
+                    return;
+                }
+
+                const allSets = getAllLeaderboardSets();
+                const store = getLeaderboardStore();
+                if (!selectedLbSet || !allSets.includes(selectedLbSet)) {
+                    selectedLbSet = allSets[0] || "";
+                }
+                const rows = selectedLbSet ? deduplicateSetRowsByName(store[selectedLbSet] || []) : [];
+
+                app.innerHTML = `<h2>Leaderboard Admin</h2>
+                    <p class="sub">Remove individual entries or clear a set. Changes update local storage and attempt to push to the shared endpoint.</p>
+                    <div class="grid">
+                        <label class="f">Question set
+                            <select id="adm_set_sel">
+                                ${
+                                    allSets.length
+                                        ? allSets
+                                              .map((s) => `<option value="${esc(s)}" ${s === selectedLbSet ? "selected" : ""}>${esc(s)}</option>`)
+                                              .join("")
+                                        : `<option value="">No sets yet</option>`
+                                }
+                            </select>
+                        </label>
+                        <label class="f">Change admin passcode
+                            <input id="adm_new_pass" type="text" value="${esc(getAdminPasscode())}">
+                        </label>
+                    </div>
+                    <div class="row">
+                        <button class="ghost" id="adm_save_pass" type="button">Save passcode</button>
+                        <button class="ghost" id="adm_push_now" type="button">Push to shared bin</button>
+                        <button class="ghost" id="adm_lock_btn" type="button">Lock admin</button>
+                        ${selectedLbSet && rows.length ? `<button class="ghost" id="adm_clear_set" type="button">Clear "${esc(selectedLbSet)}"</button>` : ""}
+                    </div>
+                    ${lastSyncStatus ? `<p class="meta">Sync status: <b>${esc(lastSyncStatus)}</b></p>` : ""}
+                    ${
+                        selectedLbSet
+                            ? `<h3>Entries · ${esc(selectedLbSet)} (${rows.length})</h3>
+                               ${
+                                   rows.length
+                                       ? `<table>
+                                              <thead><tr><th>Rank</th><th>Diver</th><th>Depth</th><th>Accuracy</th><th>Date</th><th>Action</th></tr></thead>
+                                              <tbody>
+                                                  ${rows
+                                                      .map((r, idx) => {
+                                                          const dStr = new Date(r.ts).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+                                                          return `<tr>
+                                                              <td>#${idx + 1}</td>
+                                                              <td>${esc(r.name)}</td>
+                                                              <td><b>${Number(r.depth || 0).toLocaleString("en-GB")} m</b></td>
+                                                              <td>${r.acc ?? 0}%</td>
+                                                              <td>${esc(dStr)}</td>
+                                                              <td><button class="ghost adm_rm_row" data-id="${esc(r.id)}" type="button" style="padding:4px 10px;font-size:12px">Remove</button></td>
+                                                          </tr>`;
+                                                      })
+                                                      .join("")}
+                                              </tbody>
+                                          </table>`
+                                       : `<p class="meta">No entries in <b>${esc(selectedLbSet)}</b>.</p>`
+                               }`
+                            : `<p class="meta">No leaderboard sets exist yet.</p>`
+                    }`;
+
+                const sel = $("#adm_set_sel");
+                if (sel) {
+                    sel.onchange = () => {
+                        selectedLbSet = sel.value;
+                        admin();
+                    };
+                }
+                $("#adm_save_pass").onclick = () => {
+                    const nextPass = String($("#adm_new_pass").value || "").trim();
+                    if (!nextPass) return toast("Passcode cannot be empty");
+                    LS.set(ADMIN_PASS_KEY, nextPass);
+                    toast("Admin passcode updated");
+                };
+                $("#adm_push_now").onclick = async () => {
+                    const ok = await pushSharedLeaderboard(getLeaderboardStore());
+                    toast(ok ? "Pushed leaderboard to shared bin" : `Could not push (${lastSyncStatus || "check bin settings"})`);
+                    admin();
+                };
+                $("#adm_lock_btn").onclick = () => {
+                    setAdminAuthed(false);
+                    toast("Admin locked");
+                    go("leaderboard");
+                };
+                const clearBtn = $("#adm_clear_set");
+                if (clearBtn) {
+                    clearBtn.onclick = async () => {
+                        const ok = await modal(`<p>Remove all entries in <b>${esc(selectedLbSet)}</b>?</p>`);
+                        if (!ok) return;
+                        const st = getLeaderboardStore();
+                        delete st[selectedLbSet];
+                        saveLeaderboardStore(st);
+                        await pushSharedLeaderboard(st);
+                        toast(`Cleared "${selectedLbSet}"`);
+                        admin();
+                    };
+                }
+                app.querySelectorAll(".adm_rm_row").forEach((btn) => {
+                    btn.onclick = async () => {
+                        const id = btn.dataset.id;
+                        const target = rows.find((x) => x.id === id);
+                        const ok = await modal(`<p>Remove <b>${esc(target?.name || "this entry")}</b> (${Number(target?.depth || 0).toLocaleString("en-GB")} m) from <b>${esc(selectedLbSet)}</b>?</p>`);
+                        if (!ok) return;
+                        removeLeaderboardEntry(selectedLbSet, id);
+                        toast("Removed entry");
+                        admin();
                     };
                 });
             }

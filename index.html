@@ -1078,356 +1078,8 @@
 
             const go = (h) => (location.hash === "#" + h ? route() : (location.hash = h));
 
-
-            /* ---------- per-set high-score leaderboard ---------- */
-            const LB_KEY = "tr_lb";
-            const PLAYER_KEY = "tr_player";
-            const LB_MODE_KEY = "tr_lb_mode";
-            const LB_ENDPOINT_KEY = "tr_lb_endpoint";
-            const ADMIN_PASS_KEY = "tr_admin_pass";
-            const ADMIN_AUTH_KEY = "tr_admin_authed";
-            const DEFAULT_ADMIN_PASS = "trench-admin";
-            const DEFAULT_LB_ENDPOINT = "https://api.jsonbin.io/v3/b/6b0805ab13d2c8610b13c2f4";
-            let lastSyncStatus = "";
-
-            function isLeaderboardMode() {
-                return Boolean(LS.get(LB_MODE_KEY, false));
-            }
-
-            function setLeaderboardMode(enabled) {
-                const val = Boolean(enabled);
-                LS.set(LB_MODE_KEY, val);
-                return val;
-            }
-
-            function getLeaderboardEndpoint() {
-                const saved = String(LS.get(LB_ENDPOINT_KEY, "") || "").trim();
-                return saved || DEFAULT_LB_ENDPOINT;
-            }
-
-            function setLeaderboardEndpoint(url) {
-                const clean = String(url || "").trim();
-                LS.set(LB_ENDPOINT_KEY, clean);
-                return clean;
-            }
-
-            function normalizeNameKey(name) {
-                return String(name || "You").trim().replace(/\s+/g, " ").toLowerCase();
-            }
-
-            function compareLeaderboardRows(a, b) {
-                return (
-                    (Number(b?.depth) || 0) - (Number(a?.depth) || 0) ||
-                    (Number(b?.acc) || 0) - (Number(a?.acc) || 0) ||
-                    (Number(a?.ts) || 0) - (Number(b?.ts) || 0)
-                );
-            }
-
-            // Keep at most one (best) space per diver name within a set
-            function deduplicateSetRowsByName(rows) {
-                const bestByName = new Map();
-                (Array.isArray(rows) ? rows : []).forEach((row, idx) => {
-                    if (!row || typeof row !== "object") return;
-                    const cleanName = String(row.name || "You").trim().replace(/\s+/g, " ").slice(0, 28) || "You";
-                    const nameKey = normalizeNameKey(cleanName);
-                    const candidate = {
-                        ...row,
-                        id: row.id || `${nameKey}_${row.ts || 0}_${row.depth || 0}_${idx}`,
-                        name: cleanName,
-                        depth: Number(row.depth) || 0,
-                        score: Number(row.score) || 0,
-                        acc: Number(row.acc) || 0,
-                        count: Number(row.count) || 0,
-                        ts: Number(row.ts) || Date.now(),
-                    };
-                    const prev = bestByName.get(nameKey);
-                    if (!prev || compareLeaderboardRows(candidate, prev) < 0) {
-                        bestByName.set(nameKey, candidate);
-                    }
-                });
-                return [...bestByName.values()].sort(compareLeaderboardRows).slice(0, 15);
-            }
-
-            function getLeaderboardStore() {
-                const raw = LS.get(LB_KEY, {});
-                if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
-                const cleaned = {};
-                Object.keys(raw).forEach((setName) => {
-                    cleaned[setName] = deduplicateSetRowsByName(raw[setName]);
-                });
-                return cleaned;
-            }
-
-            function saveLeaderboardStore(store) {
-                const cleaned = {};
-                Object.keys(store || {}).forEach((setName) => {
-                    cleaned[setName] = deduplicateSetRowsByName(store[setName]);
-                });
-                return LS.set(LB_KEY, cleaned);
-            }
-
-            function mergeLeaderboardStores(baseStore, incomingStore) {
-                const merged = {};
-                const allKeys = new Set([
-                    ...Object.keys(baseStore || {}),
-                    ...Object.keys(incomingStore || {}),
-                ]);
-                allKeys.forEach((setName) => {
-                    const combined = [
-                        ...(Array.isArray(baseStore?.[setName]) ? baseStore[setName] : []),
-                        ...(Array.isArray(incomingStore?.[setName]) ? incomingStore[setName] : []),
-                    ];
-                    merged[setName] = deduplicateSetRowsByName(combined);
-                });
-                return merged;
-            }
-
-            async function pullSharedLeaderboard(silent = true) {
-                const endpoint = getLeaderboardEndpoint();
-                if (!endpoint) {
-                    lastSyncStatus = "No shared endpoint configured";
-                    if (!silent) toast(lastSyncStatus);
-                    return false;
-                }
-                try {
-                    const res = await fetch(`${endpoint}/latest?meta=false`, {
-                        cache: "no-store",
-                        headers: { Accept: "application/json" },
-                    }).catch(() => fetch(endpoint, { cache: "no-store", headers: { Accept: "application/json" } }));
-                    if (!res.ok) {
-                        let detail = `HTTP ${res.status}`;
-                        try {
-                            const errJson = await res.json();
-                            if (errJson?.message) detail += `: ${errJson.message}`;
-                        } catch (e2) {}
-                        throw new Error(detail);
-                    }
-                    const data = await res.json();
-                    const remoteBoard =
-                        data && typeof data === "object" && data.record && typeof data.record === "object"
-                            ? (data.record.leaderboard !== undefined ? data.record.leaderboard : data.record)
-                            : (data?.leaderboard !== undefined ? data.leaderboard : data);
-                    if (remoteBoard && typeof remoteBoard === "object" && !Array.isArray(remoteBoard)) {
-                        const merged = mergeLeaderboardStores(getLeaderboardStore(), remoteBoard);
-                        saveLeaderboardStore(merged);
-                        lastSyncStatus = `Connected (${new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })})`;
-                        if (!silent) toast("Synced shared leaderboard");
-                        return true;
-                    }
-                    throw new Error("Invalid JSON structure");
-                } catch (e) {
-                    lastSyncStatus = `Local only (${e.message || "network/CORS blocked"})`;
-                    if (!silent) toast(`Remote sync failed: ${e.message || "check bin permissions/URL"}`);
-                }
-                return false;
-            }
-
-            async function pushSharedLeaderboard(store) {
-                const endpoint = getLeaderboardEndpoint();
-                if (!endpoint) return false;
-                const cleanStore = {};
-                Object.keys(store || {}).forEach((k) => {
-                    cleanStore[k] = deduplicateSetRowsByName(store[k]);
-                });
-                try {
-                    const res = await fetch(endpoint, {
-                        method: "PUT",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ leaderboard: cleanStore, updatedAt: Date.now() }),
-                    });
-                    if (!res.ok) {
-                        let detail = `HTTP ${res.status}`;
-                        try {
-                            const errJson = await res.json();
-                            if (errJson?.message) detail += `: ${errJson.message}`;
-                        } catch (e2) {}
-                        lastSyncStatus = `Push blocked (${detail})`;
-                        return false;
-                    }
-                    lastSyncStatus = `Synced (${new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })})`;
-                    return true;
-                } catch (e) {
-                    lastSyncStatus = `Push failed (${e.message || "network error"})`;
-                    return false;
-                }
-            }
-
-            function getPlayerName() {
-                return String(LS.get(PLAYER_KEY, "") || "").trim().replace(/\s+/g, " ");
-            }
-
-            function setPlayerName(name) {
-                const clean = String(name || "").trim().replace(/\s+/g, " ").slice(0, 28);
-                LS.set(PLAYER_KEY, clean);
-                return clean;
-            }
-
-            function inferSessionSetNames(session) {
-                const fSet = String(session?.f?.set || "").trim();
-                if (fSet && fSet !== "★") return [fSet];
-                if (fSet === "★") return ["Favourites (★)"];
-
-                const setCounts = new Map();
-                (session?.res || []).forEach((r) => {
-                    const qObj = Q.find((x) => x.id === r.id);
-                    const qSets = Array.isArray(qObj?.sets) ? qObj.sets.filter((s) => s && s !== "Needs practice") : [];
-                    qSets.forEach((s) => setCounts.set(s, (setCounts.get(s) || 0) + 1));
-                });
-
-                if (setCounts.size === 1) {
-                    return [[...setCounts.keys()][0]];
-                }
-                const fSub = String(session?.f?.subject || "").trim();
-                const fTop = String(session?.f?.topic || "").trim();
-                if (fSub && fTop) return [`${fSub} · ${fTop}`];
-                if (fSub) return [`${fSub} (All sets)`];
-                return ["All Questions Mix"];
-            }
-
-            function scoreExtendedAuto(q, rawValue, maxMarks) {
-                const text = norm(rawValue);
-                if (!text) return 0;
-                const refSource = [q.answer, q.model].filter(Boolean).join(" . ");
-                const keyPhrases = String(q.answer || "")
-                    .split(/[|.;]+/)
-                    .map(norm)
-                    .filter((p) => p.length >= 3);
-
-                if (keyPhrases.length) {
-                    let hits = 0;
-                    keyPhrases.forEach((phrase) => {
-                        const words = phrase.split(" ").filter((w) => w.length >= 4);
-                        if (text.includes(phrase)) {
-                            hits += 1;
-                        } else if (words.length) {
-                            const matchedWords = words.filter((w) => ` ${text} `.includes(` ${w} `)).length;
-                            if (matchedWords >= Math.ceil(words.length * 0.6)) hits += 0.75;
-                        }
-                    });
-                    const ratio = Math.min(1, hits / Math.max(1, Math.min(keyPhrases.length, maxMarks)));
-                    return ratio > 0 ? Math.max(1, Math.round(ratio * maxMarks)) : 0;
-                }
-
-                const refWords = [...new Set(norm(refSource).split(" ").filter((w) => w.length >= 4))];
-                if (!refWords.length) return text.length >= 8 ? Math.max(1, Math.ceil(maxMarks / 2)) : 0;
-                const matched = refWords.filter((w) => ` ${text} `.includes(` ${w} `)).length;
-                const ratio = matched / Math.min(refWords.length, Math.max(2, maxMarks * 2));
-                if (ratio >= 0.65) return maxMarks;
-                if (ratio >= 0.25) return Math.max(1, Math.round(ratio * maxMarks));
-                return 0;
-            }
-
-            function recordLeaderboardEntry(session, depth, acc, tierName, playerName = "") {
-                const store = getLeaderboardStore();
-                const setNames = inferSessionSetNames(session);
-                const who = String(playerName || getPlayerName() || "Joel").trim().replace(/\s+/g, " ") || "Joel";
-                const entryId = uid();
-
-                setNames.forEach((setName) => {
-                    const list = Array.isArray(store[setName]) ? [...store[setName]] : [];
-                    list.push({
-                        id: entryId,
-                        name: who,
-                        score: session.score,
-                        depth,
-                        acc,
-                        count: session.res.length,
-                        tier: tierName,
-                        ts: Date.now(),
-                    });
-                    store[setName] = deduplicateSetRowsByName(list);
-                });
-
-                saveLeaderboardStore(store);
-                pushSharedLeaderboard(store);
-                return { entryId, setNames };
-            }
-
-            function updateLeaderboardEntryName(entryId, newName) {
-                const clean = setPlayerName(newName) || "Joel";
-                const store = getLeaderboardStore();
-                let changed = false;
-                Object.keys(store).forEach((setName) => {
-                    store[setName] = deduplicateSetRowsByName(
-                        (store[setName] || []).map((row) => {
-                            if (row.id === entryId) {
-                                changed = true;
-                                return { ...row, name: clean };
-                            }
-                            return row;
-                        })
-                    );
-                });
-                if (changed) {
-                    saveLeaderboardStore(store);
-                    pushSharedLeaderboard(store);
-                }
-                return clean;
-            }
-
-            function removeLeaderboardEntry(setName, entryId) {
-                const store = getLeaderboardStore();
-                if (!Array.isArray(store[setName])) return false;
-                const nextRows = store[setName].filter((r) => r.id !== entryId);
-                if (nextRows.length === store[setName].length) return false;
-                store[setName] = deduplicateSetRowsByName(nextRows);
-                saveLeaderboardStore(store);
-                pushSharedLeaderboard(store);
-                return true;
-            }
-
-            function getAdminPasscode() {
-                const saved = String(LS.get(ADMIN_PASS_KEY, "") || "").trim();
-                return saved || DEFAULT_ADMIN_PASS;
-            }
-
-            function isAdminAuthed() {
-                return Boolean(sessionStorage.getItem(ADMIN_AUTH_KEY) === "1");
-            }
-
-            function setAdminAuthed(val) {
-                if (val) sessionStorage.setItem(ADMIN_AUTH_KEY, "1");
-                else sessionStorage.removeItem(ADMIN_AUTH_KEY);
-            }
-
-            function getAllLeaderboardSets() {
-                const store = getLeaderboardStore();
-                const bankSets = [...new Set(Q.flatMap((q) => (q.sets || []).filter((s) => s && s !== "Needs practice")))];
-                const scoredSets = Object.keys(store);
-                return [...new Set([...scoredSets, ...bankSets])].sort((a, b) => a.localeCompare(b));
-            }
-
-            function renderLeaderboardTable(setName, limit = 10, highlightId = "") {
-                const store = getLeaderboardStore();
-                const rows = deduplicateSetRowsByName(store[setName] || []).slice(0, limit);
-                if (!rows.length) {
-                    return `<p class="meta">No dives recorded for <b>${esc(setName)}</b> yet. Turn on Leaderboard mode and complete a dive in this set to claim #1.</p>`;
-                }
-                const medals = ["🥇", "🥈", "🥉"];
-                return `<table>
-                    <thead><tr><th>Rank</th><th>Diver</th><th>Depth</th><th>Accuracy</th><th>Tier</th><th>Date</th></tr></thead>
-                    <tbody>
-                        ${rows
-                            .map((r, idx) => {
-                                const rankLabel = medals[idx] || `#${idx + 1}`;
-                                const isHi = highlightId && r.id === highlightId;
-                                const dateStr = new Date(r.ts).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
-                                return `<tr style="${isHi ? "background:#0a7ea422;font-weight:600" : ""}">
-                                    <td>${rankLabel}</td>
-                                    <td>${esc(r.name || "Joel")}</td>
-                                    <td><b>${Number(r.depth || 0).toLocaleString("en-GB")} m</b></td>
-                                    <td>${r.acc ?? 0}% (${r.count || 0}q)</td>
-                                    <td>${esc(r.tier || "—")}</td>
-                                    <td>${esc(dateStr)}</td>
-                                </tr>`;
-                            })
-                            .join("")}
-                    </tbody>
-                </table>`;
-            }
-
             /* ---------- router ---------- */
-            const routes = { home, play, library, import: imp, leaderboard, admin, stats };
+            const routes = { home, play, library, import: imp, stats };
             function route() {
                 const r = location.hash.slice(1) || "home";
                 clearInterval(TM);
@@ -1439,8 +1091,6 @@
                         ["home", "Dive"],
                         ["library", "Questions"],
                         ["import", "Import"],
-                        ["leaderboard", "Leaderboard"],
-                        ["admin", "Admin"],
                         ["stats", "My stats"],
                     ]
                         .map(([h, n]) => `<a href="#${h}" class="${r === h ? "on" : ""}">${n}</a>`)
@@ -1914,7 +1564,6 @@
                     </div>
                     <div class="row">
                         <button class="pri" id="go">Start dive</button>
-                        <button class="${isLeaderboardMode() ? "pri" : "ghost"}" id="lb_mode_home_btn" type="button">Leaderboard: ${isLeaderboardMode() ? "ON (Auto-marked)" : "OFF"}</button>
                         <button class="ghost" id="share_deck_btn" type="button" onclick="shareDeck()">Share deck ↗</button>
                         ${sess && sess.i < sess.ids.length ? `<button class="ghost" id="res">Resume (${sess.i}/${sess.ids.length})</button>` : ""}
                         <small id="cnt"></small>
@@ -1935,12 +1584,6 @@
                         })
                 );
                 $("#go").onclick = () => startDive(f, +f.n || 7);
-                $("#lb_mode_home_btn").onclick = () => {
-                    const nextMode = !isLeaderboardMode();
-                    setLeaderboardMode(nextMode);
-                    toast(nextMode ? "Leaderboard ON: answers are automatically marked" : "Leaderboard OFF: manual mark selection enabled");
-                    home();
-                };
                 const r = $("#res");
                 if (r)
                     r.onclick = () => {
@@ -2134,16 +1777,11 @@
                 const isLast = G.i >= G.ids.length;
                 const markLabel = `${earned}/${maxMarks} mark${maxMarks === 1 ? "" : "s"}`;
                 const practiceNote = !isFullMarks ? ` · Tagged "Needs practice"` : "";
-                const lbLock = isLeaderboardMode();
                 $("#fb").innerHTML = `<div class="fb">
                     <p class="${isFullMarks ? "good" : "err"}" id="fb_status"><b>${isPositive ? `Descended +${pts * 10} m (${markLabel}${practiceNote})` : `Did not descend (+0 m · ${markLabel}${practiceNote})`}</b></p>
                     <p><small>Answer:</small> <b>${esc(formatAnswerDisplay(q))}</b></p>
                     ${q.explain ? `<p class="meta">${esc(q.explain)}</p>` : ""}
-                    ${
-                        lbLock
-                            ? `<p class="meta">Leaderboard mode is ON — marks are assigned automatically.</p>`
-                            : `<div class="row" id="fb_marks"><small>Marks awarded:</small> ${renderMarkSelector(maxMarks, earned, "m_pick")}</div>`
-                    }
+                    <div class="row" id="fb_marks"><small>Marks awarded:</small> ${renderMarkSelector(maxMarks, earned, "m_pick")}</div>
                     <div class="row"><button class="pri" id="next">${isLast ? "Surface & see tier" : "Next prompt"}</button></div>
                 </div>`;
 
@@ -2229,15 +1867,6 @@
                 if (sb) sb.remove();
 
                 const shown = formatAnswerDisplay(q);
-                if (isLeaderboardMode()) {
-                    const autoMarks =
-                        q.type === "extended"
-                            ? (v === null ? 0 : scoreExtendedAuto(q, v, maxMarks))
-                            : (ok ? maxMarks : 0);
-                    fin(autoMarks > 0, t, autoMarks);
-                    return;
-                }
-
                 if (
                     ok === null ||
                     (ok === false && (q.type === "short" || q.type === "fill") && v !== null && String(v).trim() !== "")
@@ -2286,12 +1915,6 @@
                 const acc = pct(okCount, session.res.length);
                 const tier = getTier(session.score, session.ids.length);
 
-                const lbEnabled = isLeaderboardMode();
-                const lbRecord = lbEnabled
-                    ? recordLeaderboardEntry(session, depth, acc, tier.name)
-                    : { entryId: "", setNames: inferSessionSetNames(session) };
-                const primarySet = lbRecord.setNames[0] || "All Questions Mix";
-
                 S.dives.unshift({
                     ts: Date.now(),
                     score: session.score,
@@ -2299,7 +1922,6 @@
                     tier: tier.name,
                     count: session.res.length,
                     acc,
-                    set: primarySet,
                 });
                 S.dives = S.dives.slice(0, 60);
                 saveS();
@@ -2320,19 +1942,8 @@
                     <div class="row">
                         <button class="pri" id="again">Dive again</button>
                         <a href="#home"><button class="ghost">Change filters</button></a>
-                        <a href="#leaderboard"><button class="ghost">Set leaderboard</button></a>
                         <a href="#stats"><button class="ghost">View stats</button></a>
                     </div>
-                    <h3>High scores · ${esc(primarySet)}</h3>
-                    ${
-                        lbEnabled
-                            ? `<div class="row" style="margin-top:6px">
-                                   <input id="lb_name_in" type="text" maxlength="28" value="${esc(getPlayerName())}" placeholder="Your name for the leaderboard" style="max-width:260px">
-                                   <button class="ghost" id="lb_name_save" type="button">Save name</button>
-                               </div>
-                               <div id="finish_lb_wrap">${renderLeaderboardTable(primarySet, 5, lbRecord.entryId)}</div>`
-                            : `<p class="meta">Leaderboard mode is OFF — turn on Leaderboard mode to auto-mark answers and submit runs to the leaderboard.</p>`
-                    }
                     <h3>Prompt breakdown</h3>
                     <table>
                         <thead><tr><th>Result</th><th>Question</th><th>Answer</th><th>Marks</th><th>Depth</th></tr></thead>
@@ -2357,14 +1968,6 @@
                     </table>
                 </div>`;
                 $("#again").onclick = () => startDive(session.f || {}, session.ids.length || 7);
-                const lbSaveBtn = $("#lb_name_save");
-                if (lbSaveBtn) {
-                    lbSaveBtn.onclick = () => {
-                        const updated = updateLeaderboardEntryName(lbRecord.entryId, $("#lb_name_in").value);
-                        $("#finish_lb_wrap").innerHTML = renderLeaderboardTable(primarySet, 5, lbRecord.entryId);
-                        toast(`Saved score under "${updated}"`);
-                    };
-                }
             }
 
             /* ---------- question add / edit modal ---------- */
@@ -2938,306 +2541,6 @@
                     };
             }
 
-
-            /* ---------- leaderboard ---------- */
-            let selectedLbSet = "";
-            function leaderboard() {
-                const allSets = getAllLeaderboardSets();
-                const store = getLeaderboardStore();
-                const fSet = String(LS.get("tr_f", {}).set || "").trim();
-                const lbEnabled = isLeaderboardMode();
-                const endpoint = getLeaderboardEndpoint();
-
-                if (!selectedLbSet || !allSets.includes(selectedLbSet)) {
-                    if (fSet && allSets.includes(fSet)) selectedLbSet = fSet;
-                    else if (allSets.length) selectedLbSet = allSets[0];
-                    else selectedLbSet = "";
-                }
-
-                const topBySet = allSets
-                    .map((s) => {
-                        const best = (store[s] || [])[0];
-                        return best ? { setName: s, ...best } : null;
-                    })
-                    .filter(Boolean)
-                    .sort((a, b) => b.depth - a.depth);
-
-                app.innerHTML = `<h2>Set Leaderboard</h2>
-                    <p class="sub">When Leaderboard mode is <b>ON</b>, answers are automatically marked (no manual mark picking) and dives count toward set high scores. Turn it <b>OFF</b> to choose marks manually.</p>
-                    <div class="grid">
-                        <label class="f">Question set
-                            <select id="lb_set_sel">
-                                ${
-                                    allSets.length
-                                        ? allSets
-                                              .map((s) => `<option value="${esc(s)}" ${s === selectedLbSet ? "selected" : ""}>${esc(s)}</option>`)
-                                              .join("")
-                                        : `<option value="">No sets yet</option>`
-                                }
-                            </select>
-                        </label>
-                        <label class="f">Diver name
-                            <input id="lb_default_name" type="text" maxlength="28" value="${esc(getPlayerName())}" placeholder="e.g. Joel">
-                        </label>
-                    </div>
-                    <div class="row">
-                        <button class="${lbEnabled ? "pri" : "ghost"}" id="lb_toggle_mode" type="button">Leaderboard mode: ${lbEnabled ? "ON (Auto-marked)" : "OFF (Manual marks)"}</button>
-                        <button class="ghost" id="lb_save_player" type="button">Save name</button>
-                        ${selectedLbSet ? `<button class="ghost" id="lb_dive_set" type="button">Dive this set</button>` : ""}
-                        ${selectedLbSet && (store[selectedLbSet] || []).length ? `<button class="ghost" id="lb_clear_set" type="button">Clear set scores</button>` : ""}
-                    </div>
-                    <div class="grid" style="margin-top:12px">
-                        <label class="f">Shared GitHub / Cloud Leaderboard URL (optional — for cross-device scores)
-                            <input id="lb_endpoint_in" type="url" value="${esc(endpoint)}" placeholder="https://api.jsonbin.io/v3/b/YOUR_BIN_ID">
-                        </label>
-                    </div>
-                    <div class="row">
-                        <button class="ghost" id="lb_save_endpoint" type="button">Save shared URL</button>
-                        <button class="ghost" id="lb_sync_remote" type="button">Sync shared scores</button>
-                    </div>
-                    ${
-                        selectedLbSet
-                            ? `<h3>Top dives · ${esc(selectedLbSet)}</h3>
-                               ${renderLeaderboardTable(selectedLbSet, 15)}`
-                            : `<p class="meta">Import or sync a question set and complete a dive to start tracking high scores.</p>`
-                    }
-                    <h3>Record depth per set</h3>
-                    ${
-                        topBySet.length
-                            ? `<table>
-                                   <thead><tr><th>Question Set</th><th>Record Holder</th><th>Best Depth</th><th>Accuracy</th><th>Tier</th></tr></thead>
-                                   <tbody>
-                                       ${topBySet
-                                           .map(
-                                               (row) => `<tr>
-                                                   <td><a href="#leaderboard" class="lb_jump" data-set="${esc(row.setName)}" style="color:var(--acc);text-decoration:none"><b>${esc(row.setName)}</b></a></td>
-                                                   <td>${esc(row.name || "You")}</td>
-                                                   <td><b>${Number(row.depth || 0).toLocaleString("en-GB")} m</b></td>
-                                                   <td>${row.acc ?? 0}%</td>
-                                                   <td>${esc(row.tier || "—")}</td>
-                                               </tr>`
-                                           )
-                                           .join("")}
-                                   </tbody>
-                               </table>`
-                            : `<p class="meta">No set records yet. Finish any dive with Leaderboard mode ON to log a score.</p>`
-                    }`;
-
-                $("#lb_toggle_mode").onclick = () => {
-                    const next = !isLeaderboardMode();
-                    setLeaderboardMode(next);
-                    toast(next ? "Leaderboard mode ON: answers auto-marked" : "Leaderboard mode OFF: manual marks enabled");
-                    leaderboard();
-                };
-
-                const sel = $("#lb_set_sel");
-                if (sel) {
-                    sel.onchange = () => {
-                        selectedLbSet = sel.value;
-                        leaderboard();
-                    };
-                }
-
-                const savePlayerBtn = $("#lb_save_player");
-                if (savePlayerBtn) {
-                    savePlayerBtn.onclick = () => {
-                        const saved = setPlayerName($("#lb_default_name").value);
-                        toast(saved ? `Diver name set to "${saved}"` : "Diver name cleared");
-                    };
-                }
-
-                $("#lb_save_endpoint").onclick = () => {
-                    const savedUrl = setLeaderboardEndpoint($("#lb_endpoint_in").value);
-                    toast(savedUrl ? "Shared leaderboard URL saved" : "Reset to default shared leaderboard URL");
-                    leaderboard();
-                };
-
-                $("#lb_sync_remote").onclick = async () => {
-                    setLeaderboardEndpoint($("#lb_endpoint_in").value);
-                    await pullSharedLeaderboard(false);
-                    leaderboard();
-                };
-
-                const diveSetBtn = $("#lb_dive_set");
-                if (diveSetBtn) {
-                    diveSetBtn.onclick = () => {
-                        const isSpecial = ["All Questions Mix", "Favourites (★)"].includes(selectedLbSet);
-                        if (selectedLbSet === "Favourites (★)") {
-                            startDive({ set: "★" }, +LS.get("tr_f", {}).n || 7);
-                        } else if (!isSpecial && Q.some((q) => (q.sets || []).includes(selectedLbSet))) {
-                            startDive({ set: selectedLbSet }, +LS.get("tr_f", {}).n || 7);
-                        } else {
-                            startDive({}, +LS.get("tr_f", {}).n || 7);
-                        }
-                    };
-                }
-
-                const clearSetBtn = $("#lb_clear_set");
-                if (clearSetBtn) {
-                    clearSetBtn.onclick = async () => {
-                        const ok = await modal(`<p>Clear all leaderboard scores for <b>${esc(selectedLbSet)}</b>?</p>`);
-                        if (!ok) return;
-                        const st = getLeaderboardStore();
-                        delete st[selectedLbSet];
-                        saveLeaderboardStore(st);
-                        pushSharedLeaderboard(st);
-                        toast(`Cleared scores for "${selectedLbSet}"`);
-                        leaderboard();
-                    };
-                }
-
-                app.querySelectorAll(".lb_jump").forEach((link) => {
-                    link.onclick = (e) => {
-                        e.preventDefault();
-                        selectedLbSet = link.dataset.set;
-                        leaderboard();
-                    };
-                });
-            }
-
-            /* ---------- leaderboard admin ---------- */
-            function admin() {
-                if (!isAdminAuthed()) {
-                    app.innerHTML = `<h2>Leaderboard Admin</h2>
-                        <p class="sub">Enter the admin passcode to remove entries or reset a set's scores.</p>
-                        <div class="grid" style="max-width:340px">
-                            <label class="f">Admin passcode
-                                <input id="adm_pass_in" type="password" autocomplete="off" placeholder="Enter passcode">
-                            </label>
-                        </div>
-                        <div class="row">
-                            <button class="pri" id="adm_login_btn" type="button">Unlock Admin</button>
-                            <a href="#leaderboard"><button class="ghost" type="button">Back to Leaderboard</button></a>
-                        </div>
-                        `;
-
-                    const tryUnlock = () => {
-                        const entered = String($("#adm_pass_in").value || "").trim();
-                        if (entered === getAdminPasscode()) {
-                            setAdminAuthed(true);
-                            toast("Admin unlocked");
-                            admin();
-                        } else {
-                            toast("Incorrect admin passcode");
-                        }
-                    };
-                    $("#adm_login_btn").onclick = tryUnlock;
-                    $("#adm_pass_in").addEventListener("keydown", (e) => {
-                        if (e.key === "Enter") tryUnlock();
-                    });
-                    $("#adm_pass_in").focus();
-                    return;
-                }
-
-                const allSets = getAllLeaderboardSets();
-                const store = getLeaderboardStore();
-                if (!selectedLbSet || !allSets.includes(selectedLbSet)) {
-                    selectedLbSet = allSets[0] || "";
-                }
-                const rows = selectedLbSet ? deduplicateSetRowsByName(store[selectedLbSet] || []) : [];
-
-                app.innerHTML = `<h2>Leaderboard Admin</h2>
-                    <p class="sub">Remove individual entries or clear a set. Changes update local storage and attempt to push to the shared endpoint.</p>
-                    <div class="grid">
-                        <label class="f">Question set
-                            <select id="adm_set_sel">
-                                ${
-                                    allSets.length
-                                        ? allSets
-                                              .map((s) => `<option value="${esc(s)}" ${s === selectedLbSet ? "selected" : ""}>${esc(s)}</option>`)
-                                              .join("")
-                                        : `<option value="">No sets yet</option>`
-                                }
-                            </select>
-                        </label>
-                        <label class="f">Change admin passcode
-                            <input id="adm_new_pass" type="text" value="${esc(getAdminPasscode())}">
-                        </label>
-                    </div>
-                    <div class="row">
-                        <button class="ghost" id="adm_save_pass" type="button">Save passcode</button>
-                        <button class="ghost" id="adm_push_now" type="button">Push to shared bin</button>
-                        <button class="ghost" id="adm_lock_btn" type="button">Lock admin</button>
-                        ${selectedLbSet && rows.length ? `<button class="ghost" id="adm_clear_set" type="button">Clear "${esc(selectedLbSet)}"</button>` : ""}
-                    </div>
-                    ${lastSyncStatus ? `<p class="meta">Sync status: <b>${esc(lastSyncStatus)}</b></p>` : ""}
-                    ${
-                        selectedLbSet
-                            ? `<h3>Entries · ${esc(selectedLbSet)} (${rows.length})</h3>
-                               ${
-                                   rows.length
-                                       ? `<table>
-                                              <thead><tr><th>Rank</th><th>Diver</th><th>Depth</th><th>Accuracy</th><th>Date</th><th>Action</th></tr></thead>
-                                              <tbody>
-                                                  ${rows
-                                                      .map((r, idx) => {
-                                                          const dStr = new Date(r.ts).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
-                                                          return `<tr>
-                                                              <td>#${idx + 1}</td>
-                                                              <td>${esc(r.name)}</td>
-                                                              <td><b>${Number(r.depth || 0).toLocaleString("en-GB")} m</b></td>
-                                                              <td>${r.acc ?? 0}%</td>
-                                                              <td>${esc(dStr)}</td>
-                                                              <td><button class="ghost adm_rm_row" data-id="${esc(r.id)}" type="button" style="padding:4px 10px;font-size:12px">Remove</button></td>
-                                                          </tr>`;
-                                                      })
-                                                      .join("")}
-                                              </tbody>
-                                          </table>`
-                                       : `<p class="meta">No entries in <b>${esc(selectedLbSet)}</b>.</p>`
-                               }`
-                            : `<p class="meta">No leaderboard sets exist yet.</p>`
-                    }`;
-
-                const sel = $("#adm_set_sel");
-                if (sel) {
-                    sel.onchange = () => {
-                        selectedLbSet = sel.value;
-                        admin();
-                    };
-                }
-                $("#adm_save_pass").onclick = () => {
-                    const nextPass = String($("#adm_new_pass").value || "").trim();
-                    if (!nextPass) return toast("Passcode cannot be empty");
-                    LS.set(ADMIN_PASS_KEY, nextPass);
-                    toast("Admin passcode updated");
-                };
-                $("#adm_push_now").onclick = async () => {
-                    const ok = await pushSharedLeaderboard(getLeaderboardStore());
-                    toast(ok ? "Pushed leaderboard to shared bin" : `Could not push (${lastSyncStatus || "check bin settings"})`);
-                    admin();
-                };
-                $("#adm_lock_btn").onclick = () => {
-                    setAdminAuthed(false);
-                    toast("Admin locked");
-                    go("leaderboard");
-                };
-                const clearBtn = $("#adm_clear_set");
-                if (clearBtn) {
-                    clearBtn.onclick = async () => {
-                        const ok = await modal(`<p>Remove all entries in <b>${esc(selectedLbSet)}</b>?</p>`);
-                        if (!ok) return;
-                        const st = getLeaderboardStore();
-                        delete st[selectedLbSet];
-                        saveLeaderboardStore(st);
-                        await pushSharedLeaderboard(st);
-                        toast(`Cleared "${selectedLbSet}"`);
-                        admin();
-                    };
-                }
-                app.querySelectorAll(".adm_rm_row").forEach((btn) => {
-                    btn.onclick = async () => {
-                        const id = btn.dataset.id;
-                        const target = rows.find((x) => x.id === id);
-                        const ok = await modal(`<p>Remove <b>${esc(target?.name || "this entry")}</b> (${Number(target?.depth || 0).toLocaleString("en-GB")} m) from <b>${esc(selectedLbSet)}</b>?</p>`);
-                        if (!ok) return;
-                        removeLeaderboardEntry(selectedLbSet, id);
-                        toast("Removed entry");
-                        admin();
-                    };
-                });
-            }
-
             /* ---------- stats ---------- */
             function stats() {
                 const totalAtt = S.att.length;
@@ -3284,14 +2587,13 @@
                     ${
                         S.dives.length
                             ? `<table>
-                                   <thead><tr><th>Date</th><th>Set</th><th>Tier</th><th>Depth</th><th>Accuracy</th></tr></thead>
+                                   <thead><tr><th>Date</th><th>Tier</th><th>Depth</th><th>Accuracy</th></tr></thead>
                                    <tbody>
                                        ${S.dives
                                            .slice(0, 15)
                                            .map(
                                                (d) => `<tr>
                                                    <td>${esc(new Date(d.ts).toLocaleDateString("en-GB", { day: "numeric", month: "short" }))}</td>
-                                                   <td>${esc(d.set || "—")}</td>
                                                    <td>${esc(d.tier)}</td>
                                                    <td>${d.depth} m</td>
                                                    <td>${d.acc}%</td>
@@ -3338,9 +2640,6 @@
                 }
             }
             route();
-            pullSharedLeaderboard(true).then((synced) => {
-                if (synced && (location.hash === "#leaderboard")) route();
-            });
             syncQuestionSetsFromFolder(true).then((count) => {
                 if (count > 0) {
                     const { filters: syncedF, autoDive: syncedAutoDive } = applySharedUrlParams(LS.get("tr_f", {}));

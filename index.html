@@ -3109,7 +3109,7 @@
                             <button class="pri" id="adm_login_btn" type="button">Unlock Admin</button>
                             <a href="#leaderboard"><button class="ghost" type="button">Back to Leaderboard</button></a>
                         </div>
-                        <p class="meta">Default passcode: <code>${esc(DEFAULT_ADMIN_PASS)}</code> (can be changed once unlocked).</p>`;
+                        `;
 
                     const tryUnlock = () => {
                         const entered = String($("#adm_pass_in").value || "").trim();

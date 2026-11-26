@@ -1084,6 +1084,7 @@
             const PLAYER_KEY = "tr_player";
             const LB_MODE_KEY = "tr_lb_mode";
             const LB_ENDPOINT_KEY = "tr_lb_endpoint";
+            const DEFAULT_LB_ENDPOINT = "https://api.jsonbin.io/v3/b/6b0805ab13d2c8610b13c2f4";
 
             function isLeaderboardMode() {
                 return Boolean(LS.get(LB_MODE_KEY, false));
@@ -1096,7 +1097,8 @@
             }
 
             function getLeaderboardEndpoint() {
-                return String(LS.get(LB_ENDPOINT_KEY, "") || "").trim();
+                const saved = String(LS.get(LB_ENDPOINT_KEY, "") || "").trim();
+                return saved || DEFAULT_LB_ENDPOINT;
             }
 
             function setLeaderboardEndpoint(url) {
@@ -2877,7 +2879,7 @@
                             </select>
                         </label>
                         <label class="f">Diver name
-                            <input id="lb_default_name" type="text" maxlength="28" value="${esc(getPlayerName())}" placeholder="e.g. Byron">
+                            <input id="lb_default_name" type="text" maxlength="28" value="${esc(getPlayerName())}" placeholder="e.g. Joel">
                         </label>
                     </div>
                     <div class="row">
@@ -2948,7 +2950,8 @@
 
                 $("#lb_save_endpoint").onclick = () => {
                     const savedUrl = setLeaderboardEndpoint($("#lb_endpoint_in").value);
-                    toast(savedUrl ? "Shared leaderboard URL saved" : "Cleared shared URL (using local browser storage)");
+                    toast(savedUrl ? "Shared leaderboard URL saved" : "Reset to default shared leaderboard URL");
+                    leaderboard();
                 };
 
                 $("#lb_sync_remote").onclick = async () => {
